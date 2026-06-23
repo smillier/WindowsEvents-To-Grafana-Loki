@@ -1,1 +1,1 @@
-# WindowsEvents-To-Grafana-Loki-
+# WindowsEvents-To-Grafana-Loki
