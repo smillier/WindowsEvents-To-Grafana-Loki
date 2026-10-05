@@ -1,0 +1,210 @@
+// alloy-windows-combined.alloy
+// Windows Event Log channels (Application, Security, System, Directory Service,
+// SMBServer/Audit) + Windows Defender Firewall log, both shipped to a single
+// Loki endpoint/tenant.
+
+// ---------------------------------------------------------------------------
+// Windows Event Log sources
+// ---------------------------------------------------------------------------
+
+loki.source.windowsevent "application" {
+  eventlog_name = "Application"
+  labels = {
+    job     = "windows-eventlog",
+    channel = "Application",
+  }
+  forward_to = [loki.process.windows.receiver]
+}
+
+loki.source.windowsevent "security" {
+  eventlog_name = "Security"
+  labels = {
+    job     = "windows-eventlog",
+    channel = "Security",
+  }
+  forward_to = [loki.process.windows.receiver]
+}
+
+loki.source.windowsevent "system" {
+  eventlog_name = "System"
+  labels = {
+    job     = "windows-eventlog",
+    channel = "System",
+  }
+  forward_to = [loki.process.windows.receiver]
+}
+
+loki.source.windowsevent "directory_services" {
+  eventlog_name = "Directory Service"
+  labels = {
+    job     = "windows-eventlog",
+    channel = "Directory_Services",
+  }
+  forward_to = [loki.process.windows.receiver]
+}
+
+loki.source.windowsevent "smbserver_audit" {
+  eventlog_name = "Microsoft-Windows-SMBServer/Audit"
+  labels = {
+    job     = "windows-eventlog",
+    channel = "SMBServer",
+  }
+  forward_to = [loki.process.windows.receiver]
+}
+
+loki.process "windows" {
+  stage.json {
+    expressions = {
+      event_id = "event_id",
+      level    = "levelText",
+      source   = "source",
+    }
+  }
+  stage.labels {
+    values = {
+      event_id = "",
+      level    = "",
+      source   = "",
+    }
+  }
+
+  // Pull out commonly useful nested EventData properties so they can be
+  // filtered on without indexing them as labels (kept as structured metadata
+  // instead - queryable, not part of the stream index).
+  // NOTE: verify these paths against a real log line in Explore
+  // ({job="windows-eventlog"}) - EventData property names/casing vary by
+  // event ID and Alloy schema version; adjust the right-hand side as needed.
+  stage.json {
+    expressions = {
+      target_user  = "eventData.TargetUserName",
+      subject_user = "eventData.SubjectUserName",
+      ip_address   = "eventData.IpAddress",
+      logon_type   = "eventData.LogonType",
+      workstation  = "eventData.WorkstationName",
+      process_name = "eventData.NewProcessName",
+      service_name = "eventData.ServiceName",
+      object_name  = "eventData.ObjectName",
+    }
+  }
+
+  stage.structured_metadata {
+    values = {
+      target_user  = "",
+      subject_user = "",
+      ip_address   = "",
+      logon_type   = "",
+      workstation  = "",
+      process_name = "",
+      service_name = "",
+      object_name  = "",
+    }
+  }
+
+  // Force this to constants.hostname (same value the firewall log side uses)
+  // rather than the event's own embedded Computer field, which is often an
+  // FQDN and would not label-match against the firewall stream's short name.
+  stage.static_labels {
+    values = {
+      computer = constants.hostname,
+    }
+  }
+
+  forward_to = [loki.write.endpoint.receiver]
+}
+
+// ---------------------------------------------------------------------------
+// Windows Defender Firewall log
+// ---------------------------------------------------------------------------
+
+local.file_match "firewall_logs" {
+  path_targets = [{
+    __path__ = "C:/Windows/System32/LogFiles/Firewall/pfirewall.log",
+    job      = "windows_firewall",
+    computer = constants.hostname,
+  }]
+}
+
+loki.source.file "firewall_logs" {
+  targets    = local.file_match.firewall_logs.targets
+  forward_to = [loki.process.firewall_logs.receiver]
+
+  // Firewall log gets truncated + rewritten by Windows rather than rotated by rename
+  tail_from_end = true
+}
+
+loki.process "firewall_logs" {
+  forward_to = [loki.write.endpoint.receiver]
+
+  // Drop the #Version / #Software / #Time / #Fields header lines
+  stage.drop {
+    expression          = `^#.*`
+    drop_counter_reason = "firewall_header_line"
+  }
+
+  // Parse the W3C extended fields. "-" is Windows' placeholder for "not applicable".
+  stage.regex {
+    expression = `^(?P<date>\d{4}-\d{2}-\d{2})\s+(?P<time>\d{2}:\d{2}:\d{2})\s+(?P<action>\S+)\s+(?P<protocol>\S+)\s+(?P<src_ip>\S+)\s+(?P<dst_ip>\S+)\s+(?P<src_port>\S+)\s+(?P<dst_port>\S+)\s+(?P<size>\S+)\s+(?P<tcpflags>\S+)\s+(?P<tcpsyn>\S+)\s+(?P<tcpack>\S+)\s+(?P<tcpwin>\S+)\s+(?P<icmptype>\S+)\s+(?P<icmpcode>\S+)\s+(?P<info>\S+)\s+(?P<path>\S+)`
+  }
+
+  // Combine date+time so we can parse it into a real timestamp
+  stage.template {
+    source   = "combined_ts"
+    template = "{{ .date }} {{ .time }}"
+  }
+
+  stage.timestamp {
+    source   = "combined_ts"
+    format   = "2006-01-02 15:04:05"
+    location = "Local"
+  }
+
+  // Map firewall action to a severity level, matching the "level" label
+  // convention used on the Windows Event Log side (INFO/ERROR/etc.)
+  stage.template {
+    source   = "level"
+    template = `{{ if eq .action "ALLOW" }}INFO{{ else }}ERROR{{ end }}`
+  }
+
+  // Promote low-cardinality fields to indexed labels only.
+  // Keep src_ip/dst_ip/ports out of labels - see cardinality note below.
+  stage.labels {
+    values = {
+      action   = "",
+      protocol = "",
+      path     = "",
+      level    = "",
+    }
+  }
+
+  // Everything else goes in as structured metadata: queryable, not indexed
+  stage.structured_metadata {
+    values = {
+      src_ip   = "",
+      dst_ip   = "",
+      src_port = "",
+      dst_port = "",
+      size     = "",
+      tcpflags = "",
+      tcpsyn   = "",
+      tcpack   = "",
+      tcpwin   = "",
+      icmptype = "",
+      icmpcode = "",
+      info     = "",
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Shared Loki write endpoint
+// ---------------------------------------------------------------------------
+
+loki.write "endpoint" {
+  endpoint {
+    url = "http://[loki.contoso.com]:3100/loki/api/v1/push"
+    tls_config {
+      insecure_skip_verify = true
+    }
+    tenant_id = "tenant1"
+  }
+}
